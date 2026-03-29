@@ -1,0 +1,397 @@
+---
+title: "Predictive Modelling of Dementia Diagnosis"
+author: "Wellsin Price"
+date: '2024'
+output:
+  word_document:
+    toc: true
+    toc_depth: '3'
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+  html_document:
+    highlight: tango
+    theme: cosmo
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+    df_print: kable
+subtitle: Logistic Regression with Class Imbalance Analysis
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 16/2, fig.height = 9/2)
+set.seed(4)
+```
+
+# Abstract {.unnumbered}
+
+This analysis develops a logistic regression model for predicting dementia diagnosis using a combined clinical dataset of 1,842 participants drawn from three longitudinal studies (SCANS, RUN DMC, and ASPS). Features include age, executive functioning (EF), processing speed (PS), small vessel disease (SVD) scores, and Fazekas white matter lesion scores. The model achieves 95% overall accuracy but fails to identify any positive dementia cases — a result attributable to severe class imbalance (approximately 6% positive rate). This report presents the full analytical pipeline from data cleaning through model evaluation, critically examines the class imbalance problem, and proposes remediation strategies that would improve clinical utility.
+
+**Dataset source:** [Kaggle — OPTIMAL Combined Studies](https://www.kaggle.com/datasets/fatemehmehrparvar/dementia)
+
+---
+
+# 1. Introduction
+
+Dementia is a progressive neurodegenerative disorder characterised by impairments in memory, reasoning, language, and emotional regulation. It is hallmarked by the impaired ability to reason and to recollect, with systemic complications that affect daily life. Depending on the form of dementia, pharmacological treatment typically involves acetylcholinesterase inhibitors; for Alzheimer's disease specifically, newer treatments targeting amyloid plaque and tau protein accumulation have emerged.
+
+The clinical value of predictive modelling in dementia lies in early identification: patients identified at pre-symptomatic or early stages benefit from earlier intervention, structured care planning, and enrolment in clinical trials. The ability to predict risk for its development is critical from both a medical and societal perspective.
+
+**Research Question:** Can a logistic regression model trained on cognitive performance scores and neuroimaging markers reliably predict dementia diagnosis?
+
+---
+
+# 2. Data Loading and Exploration
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(caret)
+library(e1071)
+library(pROC)
+```
+
+```{r}
+# Load dataset
+dementia <- read.csv("OPTIMAL_combined_3studies_6feb2020.csv")
+```
+
+```{r}
+# Dimensions and structure
+dim(dementia)
+str(dementia)
+```
+
+The dataset contains `r nrow(dementia)` observations and `r ncol(dementia)` variables spanning demographic information, cognitive performance measures, neuroimaging markers, and clinical diagnoses.
+
+```{r}
+# Summary statistics for key variables
+summary(dementia[, c("age", "dementia_all", "EF", "PS", "Fazekas",
+                      "SVD.Simple.Score", "SVD.Amended.Score")])
+```
+
+From this we can observe that the mean age of participants is approximately 66 years, consistent with the typical onset window for dementia symptoms. Critically, the mean of the `dementia_all` variable is approximately 0.06, indicating that roughly **6% of participants have a dementia diagnosis** — a severe class imbalance that will have significant modelling implications.
+
+---
+
+# 3. Data Cleaning
+
+## 3.1 Missing Values
+
+```{r}
+# Percentage of null values per column
+null_pct <- colSums(is.na(dementia)) * 100 / nrow(dementia)
+null_pct[null_pct > 0]
+```
+
+Missing data is present in several key variables. In this analysis, missing data points will be dropped rather than imputed to maintain precision in results.
+
+```{r}
+# Drop rows with missing values in critical variables
+dementia_clean <- dementia %>%
+  drop_na(dementia, EF, PS, Global, smoking,
+          SVD.Simple.Score, SVD.Amended.Score)
+```
+
+```{r}
+# Visualise missingness after cleaning
+cat("Rows before cleaning:", nrow(dementia), "\n")
+cat("Rows after cleaning:", nrow(dementia_clean), "\n")
+cat("Remaining missing values:", sum(is.na(dementia_clean)), "\n")
+```
+
+## 3.2 Feature Selection Rationale
+
+The education level column is excluded from the predictive model. While education contributes to cognitive reserve, it has limited direct bearing on the neurological disease process itself. The selected features are those with established clinical relevance to dementia pathology: age, cognitive performance (EF, PS), and neuroimaging burden (Fazekas, SVD scores).
+
+```{r}
+# Select modelling variables
+dementia_model <- dementia_clean %>%
+  select(age, EF, PS, SVD.Simple.Score, SVD.Amended.Score,
+         Fazekas, dementia_all, gender)
+```
+
+---
+
+# 4. Exploratory Data Analysis
+
+## 4.1 Class Distribution
+
+```{r}
+# Target variable distribution
+table(dementia_model$dementia_all)
+prop.table(table(dementia_model$dementia_all))
+```
+
+The class imbalance is stark: approximately 94% of participants are non-demented and only 6% carry a diagnosis. This imbalance will dominate model behaviour.
+
+## 4.2 Distribution of Age
+
+```{r}
+ggplot(dementia_model, aes(x = age)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white", alpha = 0.8) +
+  labs(title = "Distribution of Participant Age",
+       x = "Age (years)", y = "Count") +
+  theme_minimal()
+```
+
+## 4.3 Dementia Diagnosis by Age
+
+```{r}
+ggplot(dementia_model, aes(x = factor(dementia_all), y = age, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(title = "Relationship Between Age and Dementia Diagnosis",
+       x = "Diagnosis (0 = No, 1 = Yes)", y = "Age (years)") +
+  theme_minimal()
+```
+
+```{r}
+cor(dementia_model$dementia_all, dementia_model$age)
+```
+
+Age is weakly and positively correlated with dementia diagnosis (r = 0.21), confirming the expected age-related risk increase.
+
+## 4.4 Fazekas Score Distribution
+
+The Fazekas score represents the severity of white matter lesions in the brain — a key neuroimaging biomarker of cerebrovascular pathology.
+
+```{r}
+ggplot(dementia_model, aes(x = factor(dementia_all), y = Fazekas, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(title = "Relationship Between Diagnosis and Fazekas Score",
+       x = "Dementia Diagnosis", y = "Fazekas Score") +
+  theme_minimal()
+```
+
+```{r}
+cor(dementia_model$dementia_all, dementia_model$Fazekas)
+```
+
+The Fazekas score is weakly and positively correlated with diagnosis (r ≈ 0.23).
+
+## 4.5 Cognitive Measures by Diagnosis
+
+```{r}
+ggplot(dementia_model, aes(x = factor(dementia_all), y = EF, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(title = "Relationship Between Dementia Diagnosis and Executive Functioning",
+       x = "Dementia Diagnosis", y = "Executive Functioning Rating") +
+  theme_minimal()
+```
+
+```{r}
+cor(dementia_model$dementia_all, dementia_model$EF)
+```
+
+```{r}
+ggplot(dementia_model, aes(x = factor(dementia_all), y = PS, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(title = "Relationship Between Dementia Diagnosis and Processing Speed",
+       x = "Dementia Diagnosis", y = "Processing Speed") +
+  theme_minimal()
+```
+
+```{r}
+cor(dementia_model$dementia_all, dementia_model$PS)
+```
+
+## 4.6 SVD Scores by Diagnosis
+
+```{r}
+ggplot(dementia_model, aes(x = factor(dementia_all), y = SVD.Simple.Score, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(title = "Relationship Between Dementia Diagnosis and SVD Simple Score",
+       x = "Dementia Diagnosis", y = "SVD Simple Score") +
+  theme_minimal()
+```
+
+```{r}
+cor(dementia_model$dementia_all, dementia_model$SVD.Simple.Score)
+```
+
+```{r}
+ggplot(dementia_model, aes(x = factor(dementia_all), y = SVD.Amended.Score, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("steelblue", "coral")) +
+  labs(title = "Relationship Between Dementia Diagnosis and SVD Amended Score",
+       x = "Dementia Diagnosis", y = "SVD Amended Score") +
+  theme_minimal()
+```
+
+```{r}
+cor(dementia_model$dementia_all, dementia_model$SVD.Amended.Score)
+```
+
+## 4.7 Correlation Summary
+
+| Feature              | Correlation (r) | Direction               |
+|:---------------------|:---------------:|:------------------------|
+| Age                  | ~0.21           | Positive (weak)         |
+| Executive Functioning| ~−0.30          | Negative (weak–moderate)|
+| Processing Speed     | ~−0.33          | Negative (moderate)     |
+| Fazekas Score        | ~0.23           | Positive (weak)         |
+| SVD Simple Score     | ~0.29           | Positive (weak–moderate)|
+| SVD Amended Score    | ~0.33           | Positive (moderate)     |
+
+The direction of all correlations is clinically coherent: higher cognitive scores are associated with lower dementia probability, while higher neuroimaging burden and age are associated with higher probability. However, no individual predictor exceeds r = 0.33, indicating that prediction requires multivariate modelling.
+
+---
+
+# 5. Predictive Model: Logistic Regression
+
+## 5.1 Prepare Features and Target
+
+```{r}
+# Define features and target
+features <- dementia_model %>%
+  select(age, EF, PS, SVD.Simple.Score, SVD.Amended.Score, Fazekas)
+
+target <- factor(dementia_model$dementia_all, levels = c(0, 1),
+                 labels = c("No", "Yes"))
+```
+
+## 5.2 Normalise Features
+
+```{r}
+# Z-score normalisation
+preprocess_params <- preProcess(features, method = c("center", "scale"))
+features_scaled <- predict(preprocess_params, features)
+
+head(features_scaled)
+```
+
+## 5.3 Train/Test Split
+
+```{r}
+# 80/20 split with stratification
+train_index <- createDataPartition(target, p = 0.8, list = FALSE, times = 1)
+x_train <- features_scaled[train_index, ]
+x_test  <- features_scaled[-train_index, ]
+y_train <- target[train_index]
+y_test  <- target[-train_index]
+
+cat("Train set:", nrow(x_train), "observations\n")
+cat("Test set:", nrow(x_test), "observations\n")
+```
+
+## 5.4 Fit Logistic Regression
+
+```{r}
+# Combine for formula interface
+train_data <- cbind(x_train, dementia_dx = y_train)
+
+# Fit model
+lr_model <- glm(dementia_dx ~ ., data = train_data, family = binomial)
+summary(lr_model)
+```
+
+## 5.5 Predictions
+
+```{r}
+# Predicted probabilities on test set
+test_data <- cbind(x_test, dementia_dx = y_test)
+yhat_prob <- predict(lr_model, newdata = test_data, type = "response")
+
+# Predicted classes at 0.5 threshold
+yhat <- factor(ifelse(yhat_prob > 0.5, "Yes", "No"),
+               levels = c("No", "Yes"))
+```
+
+---
+
+# 6. Model Evaluation
+
+## 6.1 Confusion Matrix
+
+```{r}
+cm <- confusionMatrix(yhat, y_test, positive = "Yes")
+cm
+```
+
+## 6.2 Classification Report
+
+```{r}
+# Extract key metrics
+cat("Overall Accuracy:", round(cm$overall["Accuracy"], 4), "\n")
+cat("Sensitivity (Recall for Dementia):", round(cm$byClass["Sensitivity"], 4), "\n")
+cat("Specificity:", round(cm$byClass["Specificity"], 4), "\n")
+```
+
+The model achieves approximately 95% overall accuracy — but examination of the confusion matrix reveals it **predicts "No" for every observation**. All positive dementia cases are misclassified as negative (false negatives). The model has learned the trivial strategy of predicting the majority class.
+
+## 6.3 ROC Curve
+
+```{r}
+roc_obj <- roc(y_test, yhat_prob)
+plot(roc_obj, main = "ROC Curve — Dementia Prediction",
+     col = "steelblue", lwd = 2)
+cat("AUC:", round(auc(roc_obj), 4), "\n")
+```
+
+The AUC provides a more informative metric than accuracy: it measures the model's ability to rank positive cases higher than negative cases, regardless of the classification threshold. An AUC of 0.5 indicates no discriminative ability (equivalent to random guessing).
+
+---
+
+# 7. Critical Analysis: The Class Imbalance Problem
+
+The model's failure to identify any positive dementia cases is not a failure of logistic regression per se, but a consequence of training on a severely imbalanced dataset without compensatory measures. This is a well-documented challenge in clinical prediction modelling.
+
+## 7.1 Why Accuracy Is Misleading
+
+A trivial classifier that always predicts "no dementia" would achieve approximately 94% accuracy in this dataset. The logistic regression model's 95% accuracy therefore represents a marginal improvement over this naive baseline — meaning the model has learned almost nothing beyond the base rate.
+
+**Accuracy is an inappropriate primary metric for imbalanced classification.** AUC-ROC, precision-recall curves, and the F1-score for the minority class provide far more informative assessments.
+
+## 7.2 Proposed Remediation Strategies
+
+Several methodological approaches could address the imbalance:
+
+- **Class Weighting:** Adjusting the loss function to penalise misclassification of the minority class proportionally to its underrepresentation. In R: `glm(..., weights = ...)` or `caret::train(..., classProbs = TRUE)` with weighted sampling.
+
+- **SMOTE (Synthetic Minority Oversampling):** Generating synthetic positive examples by interpolating between existing cases. Available via the `DMwR` or `themis` R packages.
+
+- **Threshold Adjustment:** Lowering the decision threshold below 0.5 to increase sensitivity at the cost of specificity — a trade-off that is clinically appropriate when false negatives carry greater consequences than false positives.
+
+- **Alternative Algorithms:** Ensemble methods (Random Forest, Gradient Boosting) often handle class imbalance more robustly and would enable model comparison.
+
+- **Evaluation Metric Revision:** Future iterations should report AUC-ROC, precision-recall AUC, and F1-score for the positive class as primary metrics.
+
+---
+
+# 8. Conclusion
+
+This analysis demonstrates both the promise and the methodological challenges of applying machine learning to clinical dementia prediction. The exploratory analysis confirms that cognitive performance scores and neuroimaging biomarkers are associated with dementia status in the expected directions, and the predicted probabilities suggest the features contain genuine discriminative information.
+
+However, the severe class imbalance causes the model to adopt a conservative majority-class prediction strategy that renders it clinically useless in its current form. A 95% accurate model that identifies zero dementia cases is not merely unhelpful — it is actively deceptive.
+
+The broader lesson is methodological: **in medical prediction tasks, high accuracy can mask complete failure on the task that matters.** The critical next step is to implement the remediation strategies above and evaluate performance using metrics sensitive to minority-class identification.
+
+---
+
+# References
+
+- OPTIMAL Combined Studies Dataset (February 2020). Three-study longitudinal dementia cohort (SCANS, RUN DMC, ASPS).
+- Chawla, N.V., Bowyer, K.W., Hall, L.O., & Kegelmeyer, W.P. (2002). SMOTE: Synthetic Minority Over-sampling Technique. *JAIR*, 16, 321–357.
+- Kuhn, M. (2008). Building Predictive Models in R Using the caret Package. *Journal of Statistical Software*, 28(5).
+
+---
+
+# Technical Appendix
+
+- **Language:** R
+- **Packages:** tidyverse, caret, e1071, pROC
+- **Model:** Logistic Regression (GLM, binomial family)
+- **Data Split:** 80/20 stratified train/test
+- **Preprocessing:** Z-score normalisation (center + scale)
